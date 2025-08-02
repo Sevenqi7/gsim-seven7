@@ -10,6 +10,7 @@ struct Config {
   std::string sep_aggr;
   int MergeWhenSize;
   int When2muxBound;
+  int ThreadNum;
   Config();
 };
 

@@ -28,6 +28,7 @@ Config::Config() {
   sep_aggr = "$$";
   MergeWhenSize = 5;
   When2muxBound = 2;
+  ThreadNum = 1;
 }
 Config globalConfig;
 
@@ -73,6 +74,7 @@ static char* parseCommandLine(int argc, char** argv) {
       {"sep-aggr", required_argument, nullptr, 0},
       {"when-size", required_argument, nullptr, 0},
       {"when2mux-bound", required_argument, nullptr, 0},
+      {"thread", required_argument, nullptr, 0},
       {nullptr, no_argument, nullptr, 0},
   };
 
@@ -89,6 +91,7 @@ static char* parseCommandLine(int argc, char** argv) {
                 case 6: globalConfig.sep_aggr = optarg; break;
                 case 7: sscanf(optarg, "%d", &globalConfig.MergeWhenSize); break;
                 case 8: sscanf(optarg, "%d", &globalConfig.When2muxBound); break;
+                case 9: sscanf(optarg, "%d", &globalConfig.ThreadNum); break;
                 case 0:
                 default: printUsage(argv[0]); exit(EXIT_SUCCESS);
               }
@@ -131,7 +134,7 @@ int main(int argc, char** argv) {
   graph* g = NULL;
   static int dumpIdx = 0;
   const char *InputFileName = parseCommandLine(argc, argv);
-
+  printf("threadnum: %d\n", globalConfig.ThreadNum);
   size_t size = 0, mapSize = 0;
   char *strbuf;
   FUNC_TIMER(strbuf = readFile(InputFileName, size, mapSize));
