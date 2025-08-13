@@ -17,9 +17,11 @@ class graph {
 
   FILE* genHeaderStart();
   void genNodeDef(FILE* fp, Node* node);
+  void genSubGraphDef(FILE *fp);
   void genInterfaceInput(Node* input);
   void genInterfaceOutput(Node* output);
   void genStep(int subStepIdxMax);
+  void genStepForThread(int subStepIdxMax);
   void genHeaderEnd(FILE* fp);
   int genNodeStepStart(SuperNode* node, uint64_t mask, int idx, std::string flagName, int indent);
   int genNodeStepEnd(SuperNode* node, int indent);
@@ -27,6 +29,7 @@ class graph {
   void nodeDisplay(Node* member, int indent);
   void genMemRead(FILE* fp);
   int genActivate();
+  int genActivateForThread();
   void genUpdateRegister(FILE* fp);
   void genMemWrite(FILE* fp);
   void saveDiffRegs();
@@ -74,6 +77,9 @@ class graph {
   std::vector<SuperNode*> sortedSuper;
   std::vector<SuperNode*> allReset;
   std::vector<std::string> extDecl;
+  std::vector<graph *> subGraphs;   // used for multithreading
+  std::map<Node *, std::set<Node *> *> snapTable;
+  int threadId = -1; // -1 if multithreading is not specified
   std::string name;
   int nodeNum = 0;
   void addReg(Node* reg) {
@@ -83,6 +89,7 @@ class graph {
   void topoSort();
   void instsGenerator();
   void cppEmitter();
+  void cppEmitterMultithread();
   void usedBits();
   void traversal();
   void traversalNoTree();
@@ -103,6 +110,7 @@ class graph {
   void exprOpt();
   void patternDetect();
   void graphPartition();
+  void naiveRepcutForThreads(int numThreads);
   void MFFCPartition();
   void mergeEssentSmallSubling(size_t maxSize, double sim);
   void essentPartition();

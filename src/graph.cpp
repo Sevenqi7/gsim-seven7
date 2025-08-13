@@ -1,4 +1,6 @@
 #include "common.h"
+#include "graph.h"
+#include "Node.h"
 
 void graph::reconnectAll() {
   for (SuperNode* super : sortedSuper) {

@@ -3,13 +3,17 @@
 */
 
 #include "common.h"
+#include "debug.h"
+#include "graph.h"
 #include "util.h"
 
+#include <cassert>
 #include <cstddef>
 #include <cstdio>
 #include <map>
 #include <string>
 #include <utility>
+#include <filesystem>
 
 #define ACTIVE_WIDTH 8
 #define RESET_PER_FUNC 400
@@ -33,6 +37,7 @@ static int superId = 0;
 static int activeFlagNum = 0;
 static std::set<Node*> definedNode;
 static std::map<int, SuperNode*> cppId2Super;
+static std::vector<std::pair<int, int>> threadSuperIdBound;
 static std::set<int> alwaysActive;
 
 static std::map<Node*, std::pair<int, int>> super2ResetId;  // uint & async reset
@@ -110,15 +115,17 @@ ActiveType activeSet2bitMap(std::set<int>& activeId, std::map<uint64_t, ActiveTy
   return std::make_tuple(ret, comment, uniqueIdx);
 }
 
-std::string updateActiveStr(int idx, uint64_t mask) {
-  if (mask <= MAX_U8) return format("activeFlags[%d] |= 0x%lx;", idx, mask);
-  if (mask <= MAX_U16) return format("*(uint16_t*)&activeFlags[%d] |= 0x%lx;", idx, mask);
-  if (mask <= MAX_U32) return format("*(uint32_t*)&activeFlags[%d] |= 0x%lx;", idx, mask);
-  return format("*(uint64_t*)&activeFlags[%d] |= 0x%lx;", idx, mask);
+std::string updateActiveStr(int idx, uint64_t mask, int threadId = -1) {
+  auto activeStr = threadId == -1 ? std::string("activeFlags") : format("activeFlags$t%d", threadId);
+  if (mask <= MAX_U8) return format("%s[%d] |= 0x%lx;",activeStr.c_str(), idx, mask);
+  if (mask <= MAX_U16) return format("*(uint16_t*)&%s[%d] |= 0x%lx;",activeStr.c_str(), idx, mask);
+  if (mask <= MAX_U32) return format("*(uint32_t*)&%s[%d] |= 0x%lx;",activeStr.c_str(), idx, mask);
+  return format("*(uint64_t*)&%s[%d] |= 0x%lx;",activeStr.c_str(), idx, mask);
 }
 
-std::string updateActiveStr(int idx, uint64_t mask, std::string& cond, int uniqueId) {
-  auto activeFlags = std::string("activeFlags[") + std::to_string(idx) + std::string("]");
+std::string updateActiveStr(int idx, uint64_t mask, std::string& cond, int uniqueId, int threadId = -1) {
+  auto activeStr = threadId == -1 ? std::string("activeFlags") : format("activeFlags$t%d", threadId);
+  auto activeFlags = activeStr + std::string("[") + std::to_string(idx) + std::string("]");
 
   if (mask <= MAX_U8) {
     if (uniqueId >= 0) return format("%s |= %s%s;", activeFlags.c_str(), cond.c_str(), shiftBits(uniqueId, ShiftDir::Left).c_str());
@@ -163,6 +170,8 @@ FILE* graph::genHeaderStart() {
   includeLib(header, "cstring", true);
   includeLib(header, "map", true);
   includeLib(header, "cstdarg", true);
+  if(subGraphs.size() != 0)
+      includeLib(header, "thread", true);
   newLine(header);
 
   fprintf(header, "\n// User configuration\n");
@@ -215,15 +224,61 @@ void graph::genInterfaceInput(Node* input) {
   emitFuncDecl(0, "void S%s::set_%s(%s val) {\n", name.c_str(), input->name.c_str(), widthUType(input->width).c_str());
   emitBodyLock(1, "if (%s != val) { \n", input->name.c_str());
   emitBodyLock(2, "%s = val;\n", input->name.c_str());
+
   /* update nodes in the same superNode */
-  std::set<int> allNext;
-  for (Node* next : input->next) {
-    if (next->super->cppId >= 0) allNext.insert(next->super->cppId);
-  }
-  std::map<uint64_t, ActiveType> bitMapInfo;
-  activeSet2bitMap(allNext, bitMapInfo, -1);
-  for (auto iter : bitMapInfo) {
-    emitBodyLock(2, "%s // %s\n", updateActiveStr(iter.first, ACTIVE_MASK(iter.second)).c_str(), ACTIVE_COMMENT(iter.second).c_str());
+  if (subGraphs.size() == 0) {
+    std::set<int> allNext;
+    for (Node* next : input->next) {
+      if (next->super->cppId >= 0) allNext.insert(next->super->cppId);
+    }
+    std::map<uint64_t, ActiveType> bitMapInfo;
+    activeSet2bitMap(allNext, bitMapInfo, -1);
+    for (auto iter : bitMapInfo) {
+      emitBodyLock(2, "%s // %s\n", updateActiveStr(iter.first, ACTIVE_MASK(iter.second)).c_str(), ACTIVE_COMMENT(iter.second).c_str(), threadId);
+    }
+  } else {
+
+    std::vector<std::set<int> *> allNextList;
+    for (int i=0;i<subGraphs.size();i++) allNextList.push_back(new std::set<int>);
+    for (Node* next : input->next) {
+      if (next->super->cppId >= 0){
+        for(int i = 0; i < subGraphs.size(); i++){
+          int beg = threadSuperIdBound[i].first;
+          int end = threadSuperIdBound[i].second;
+          if (next->super->cppId >= beg && next->super->cppId < end) {
+            allNextList[i]->insert(next->super->cppId);
+            break;
+          }
+        }
+      } 
+    }
+
+    // update activeFlags for input port's snapshot in threads
+    if (snapTable.find(input) != snapTable.end()) {
+      auto it = snapTable.find(input);
+      for(Node *snap : *it->second) {
+        for (Node* next : snap->next) {
+          if (next->super->cppId >= 0){
+            for(int i = 0; i < subGraphs.size(); i++){
+              int beg = threadSuperIdBound[i].first;
+              int end = threadSuperIdBound[i].second;
+              if (next->super->cppId >= beg && next->super->cppId < end) {
+                allNextList[i]->insert(next->super->cppId);
+                break;
+              }
+            }
+          } 
+        }
+      }
+    }
+    for (int i = 0; i < subGraphs.size(); i ++) {
+      auto g = subGraphs[i];
+      std::map<uint64_t, ActiveType> bitMapInfo;
+      activeSet2bitMap(*allNextList[i], bitMapInfo, -1);
+      for (auto iter : bitMapInfo) {
+        emitBodyLock(2, "%s // %s\n", updateActiveStr(iter.first, ACTIVE_MASK(iter.second), g->threadId).c_str(), ACTIVE_COMMENT(iter.second).c_str());
+      }
+    }
   }
   emitBodyLock(1, "}\n");
   emitBodyLock(0, "}\n");
@@ -330,6 +385,7 @@ void graph::genNodeDef(FILE* fp, Node* node) {
   if (node->type == NODE_SPECIAL || node->type == NODE_REG_RESET || (node->status != VALID_NODE)) return;
   if (node->type == NODE_REG_DST && !node->regSplit) return;
   if (node->type == NODE_WRITER) return;
+  if (node->type == NODE_REG_SNAP) return;
   if (node->isLocal()) return;
 #if defined(GSIM_DIFF) || defined(VERILATOR_DIFF)
   genDiffSig(fp, node);
@@ -403,7 +459,7 @@ void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldN
       else emitBodyLock(indent, "%s |= 0x%lx; // %s\n", flagName.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
     }
     for (auto iter : bitMapInfo) {
-      auto str = opt ? updateActiveStr(iter.first, ACTIVE_MASK(iter.second), condName, ACTIVE_UNIQUE(iter.second)) : updateActiveStr(iter.first, ACTIVE_MASK(iter.second));
+      auto str = opt ? updateActiveStr(iter.first, ACTIVE_MASK(iter.second), condName, ACTIVE_UNIQUE(iter.second), threadId) : updateActiveStr(iter.first, ACTIVE_MASK(iter.second), threadId);
       emitBodyLock(indent, "%s // %s\n", str.c_str(), ACTIVE_COMMENT(iter.second).c_str());
     }
   #ifdef PERF
@@ -424,7 +480,7 @@ void graph::activateUncondNext(Node* node, std::set<int>& activateId, bool inSte
   auto curMask = activeSet2bitMap(activateId, bitMapInfo, node->super->cppId);
   if (ACTIVE_MASK(curMask) != 0) emitBodyLock(indent, "%s |= 0x%lx; // %s\n", flagName.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
   for (auto iter : bitMapInfo) {
-    emitBodyLock(indent, "%s // %s\n", updateActiveStr(iter.first, ACTIVE_MASK(iter.second)).c_str(), ACTIVE_COMMENT(iter.second).c_str());
+    emitBodyLock(indent, "%s // %s\n", updateActiveStr(iter.first, ACTIVE_MASK(iter.second), threadId).c_str(), ACTIVE_COMMENT(iter.second).c_str());
   }
 #ifdef PERF
   #if ENABLE_ACTIVATOR
@@ -509,7 +565,7 @@ int graph::genNodeStepEnd(SuperNode* node, int indent) {
 }
 
 bool Node::isLocal() { // TODO: isArray is OK
-  return status == VALID_NODE && type == NODE_OTHERS && !anyNextActive() && !isArray() && !isReset();
+  return status == VALID_NODE && (type == NODE_OTHERS || type == NODE_REG_SNAP) && !anyNextActive() && (!isArray()) && !isReset();
 }
 
 int graph::translateInst(InstInfo inst, int indent, std::string flagName) {
@@ -571,11 +627,14 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, int indent) { /
       indent = translateInst(inst, indent, flagName);
     }
     if (super->superType == SUPER_ASYNC_RESET) emitBodyLock(indent, "subReset%d();\n", super2ResetId[super->resetNode].second);
-    emitBodyLock(indent, "#ifdef ENABLE_LOG\n");
-    emitBodyLock(indent ++, "if (cycles >= LOG_START && cycles <= LOG_END) {\n");
-    for (Node* n : super->member) nodeDisplay(n, indent);
-    emitBodyLock(-- indent, "}\n");
-    emitBodyLock(indent, "#endif\n");
+
+    if(threadId == -1) {
+        emitBodyLock(indent, "#ifdef ENABLE_LOG\n");
+        emitBodyLock(indent ++, "if (cycles >= LOG_START && cycles <= LOG_END) {\n");
+        for (Node* n : super->member) nodeDisplay(n, indent);
+        emitBodyLock(-- indent, "}\n");
+        emitBodyLock(indent, "#endif\n");
+    }
   }
 }
 
@@ -620,6 +679,51 @@ int graph::genActivate() {
     return nextSubStepIdx - 1; // return the maxinum subStepIdx currently used
 }
 
+int graph::genActivateForThread() {
+    assert(threadId != -1);
+    emitFuncDecl(0, "void S%s::subStep0$t%d() {\n", name.c_str(), threadId);
+    int indent = 1;
+    int nextSubStepIdx = 1;
+    std::string nextFuncDef = format("void S%s::subStep%d$t%d()", name.c_str(), threadId, nextSubStepIdx);
+    bool prevActiveWhole = false;
+
+    int beg = threadSuperIdBound[threadId].first;
+    int end = threadSuperIdBound[threadId].second;
+    for (int idx = beg; idx < end; idx ++) {
+      int id;
+      uint64_t mask;
+      std::tie(id, mask) = setIdxMask(idx);
+      int offset = idx % ACTIVE_WIDTH;
+      if (offset == 0) {
+        if (prevActiveWhole) {
+          emitBodyLock(--indent, "}\n");
+        }
+        prevActiveWhole = true;
+        for (int j = 0; j < ACTIVE_WIDTH && idx + j < superId; j ++) {
+          if (isAlwaysActive(idx + j)) prevActiveWhole = false;
+        }
+        if (prevActiveWhole) {
+          bool newFile = __emitSrc(indent ++, true, false, nextFuncDef.c_str(), "if(unlikely(activeFlags$t%d[%d] != 0)) {\n", threadId, id);
+          if (newFile) {
+            nextFuncDef = format("void S%s::subStep%d()", name.c_str(), ++ nextSubStepIdx);
+          }
+          emitBodyLock(indent, "uint%d_t oldFlag = activeFlags$t%d[%d];\n", ACTIVE_WIDTH, threadId, id);
+          emitBodyLock(indent, "activeFlags$t%d[%d] = 0;\n", threadId, id);
+        }
+      }
+      SuperNode* super = cppId2Super[idx];
+      std::string flagName = prevActiveWhole ? "oldFlag" : format("activeFlags$t%d[%d]", threadId, id);
+      indent = genNodeStepStart(super, mask, idx, flagName, indent);
+      genSuperEval(super, flagName, indent);
+      indent = genNodeStepEnd(super, indent);
+    }
+    emitBodyLock(--indent, "}\n");
+    if (prevActiveWhole) emitBodyLock(--indent, "}\n");
+
+    return nextSubStepIdx - 1; // return the maxinum subStepIdx currently used
+}
+
+
 void graph::genResetDef(SuperNode* super, bool isUIntReset, int indent) {
   emitBodyLock(indent ++, "void S%s::subReset%d(){ // %s reset\n", name.c_str(), resetFuncNum, isUIntReset ? "uint" : "async");
   if (super2ResetId.find(super->resetNode) != super2ResetId.end()) {
@@ -630,23 +734,61 @@ void graph::genResetDef(SuperNode* super, bool isUIntReset, int indent) {
   resetFuncNum ++;
   std::string resetName = super->resetNode->type == NODE_REG_SRC ? RESET_NAME(super->resetNode).c_str() : super->resetNode->name.c_str();
   emitBodyLock(indent ++, "if(unlikely(%s)) {\n", resetName.c_str());
-  std::set<int> allNext;
-  for (size_t i = 0; i < super->member.size(); i ++) {
-    Node* node = super->member[i];
-    if (node->type == NODE_REG_RESET) node = node->getResetSrc();
-    for (Node* next : node->next) {
-      if (next->super->cppId >= 0) allNext.insert(next->super->cppId);
+
+  if (subGraphs.size() == 0) {
+    std::set<int> allNext;
+    for (size_t i = 0; i < super->member.size(); i ++) {
+      Node* node = super->member[i];
+      if (node->type == NODE_REG_RESET) node = node->getResetSrc();
+      for (Node* next : node->next) {
+        if (next->super->cppId >= 0) allNext.insert(next->super->cppId);
+      }
+    }
+    if (allNext.size() > 100) emitBodyLock(indent, "activateAll();\n");
+    else {
+      std::map<uint64_t, ActiveType> bitMapInfo;
+      activeSet2bitMap(allNext, bitMapInfo, -1);
+      for (auto iter : bitMapInfo) {
+        emitBodyLock(indent, "%s // %s\n", updateActiveStr(iter.first, ACTIVE_MASK(iter.second)).c_str(), ACTIVE_COMMENT(iter.second).c_str());
+      }
+    }
+  } else {
+    // For multithreading, update acitiveFlags in each thread
+    std::vector<std::set<int> *> allNextList;
+    for (size_t i = 0; i < super->member.size(); i ++) {
+      Node* node = super->member[i];
+      if (node->type == NODE_REG_RESET && subGraphs.size() != 0) {
+        node = node->getResetSrc();
+        for(auto snap : *snapTable[node]) {
+          if (snap->super->cppId >= 0) {
+            for (int i = 0;i < subGraphs.size(); i ++) {
+              int beg = threadSuperIdBound[i].first;
+              int end = threadSuperIdBound[i].second;
+              allNextList.push_back(new std::set<int>);
+              if(snap->super->cppId >= beg && snap->super->cppId < end ) {
+                allNextList[i]->insert(snap->super->cppId);
+                break;
+              }
+            }
+          } 
+        }
+      }
+    }
+    size_t allNextSize = 0;
+    for(auto it : allNextList) allNextSize += it->size();
+    if (allNextSize > 100) emitBodyLock(indent, "activateAll();\n");
+    else {
+      for (int i = 0; i < subGraphs.size(); i ++) {
+        auto g = subGraphs[i];
+        std::map<uint64_t, ActiveType> bitMapInfo;
+        activeSet2bitMap(*allNextList[i], bitMapInfo, -1);
+        for (auto iter : bitMapInfo) {
+          emitBodyLock(indent, "%s // %s\n", updateActiveStr(iter.first, ACTIVE_MASK(iter.second), g->threadId).c_str(), ACTIVE_COMMENT(iter.second).c_str());
+        }
+      }
     }
   }
 
-  if (allNext.size() > 100) emitBodyLock(indent, "activateAll();\n");
-  else {
-    std::map<uint64_t, ActiveType> bitMapInfo;
-    activeSet2bitMap(allNext, bitMapInfo, -1);
-    for (auto iter : bitMapInfo) {
-      emitBodyLock(indent, "%s // %s\n", updateActiveStr(iter.first, ACTIVE_MASK(iter.second)).c_str(), ACTIVE_COMMENT(iter.second).c_str());
-    }
-  }
   emitBodyLock(-- indent, "}\n");
   for (InstInfo inst : super->insts) {
     switch (inst.infoType) {
@@ -692,21 +834,60 @@ void graph::genResetAll() {
 
 void graph::genStep(int subStepIdxMax) {
   emitFuncDecl(0, "void S%s::step() {\n", name.c_str());
-  emitBodyLock(1, "resetAll();\n");
-  for (SuperNode* super : sortedSuper) {
-    for (Node* member : super->member) {
-      if (member->isReset() && member->type == NODE_REG_SRC) {
-        emitBodyLock(1, "%s = %s;\n", RESET_NAME(member).c_str(), member->name.c_str());
+  
+  if(subGraphs.size() == 0) {
+    emitBodyLock(1, "resetAll();\n");
+    for (SuperNode* super : sortedSuper) {
+      for (Node* member : super->member) {
+        if (member->isReset() && member->type == NODE_REG_SRC) {
+          emitBodyLock(1, "%s = %s;\n", RESET_NAME(member).c_str(), member->name.c_str());
+        }
       }
     }
-  }
-  for (int i = 0; i <= subStepIdxMax; i ++) {
-    emitBodyLock(1, "subStep%d();\n", i);
+    for (int i = 0; i <= subStepIdxMax; i ++) {
+      emitBodyLock(1, "subStep%d();\n", i);
+    }
+  } else {
+    emitBodyLock(1, "resetAll();\n");
+    emitBodyLock(1, "global_update();\n");
+    for (int i = 0; i < subGraphs.size(); i ++) {
+      emitBodyLock(1, "std::thread th%d(&S%s::step$t%d, this);\n", i, name.c_str(), i);
+    }
+    for (int i = 0; i < subGraphs.size(); i ++) {
+      emitBodyLock(1, "th%d.join();\n", i);
+    }
   }
 
   emitBodyLock(1, "cycles ++;\n");
+  emitBodyLock(0, "#ifdef ENABLE_LOG\n");
+  emitBodyLock(1, "if (cycles >= LOG_START && cycles <= LOG_END) {\n");
+  // for (auto *s : sortedSuper) {
+      for (Node* n : definedNode) nodeDisplay(n, 2);
+  // }
+  emitBodyLock(1, "}\n");
+  emitBodyLock(0, "#endif\n");
   emitBodyLock(0, "}\n");
 }
+
+void graph::genStepForThread(int subStepIdxMax) {
+  assert(threadId != -1);
+  emitFuncDecl(0, "void S%s::step$t%d() {\n", name.c_str(), threadId);
+  // emitBodyLock(1, "resetAll();\n");
+  // for (SuperNode* super : sortedSuper) {
+  //   for (Node* member : super->member) {
+  //     if (member->isReset() && member->type == NODE_REG_SRC) {
+  //       emitBodyLock(1, "%s = %s;\n", RESET_NAME(member).c_str(), member->name.c_str());
+  //     }
+  //   }
+  // }
+  for (int i = 0; i <= subStepIdxMax; i ++) {
+    emitBodyLock(1, "subStep%d$t%d();\n", i);
+  }
+
+  // emitBodyLock(1, "cycles ++;\n");
+  emitBodyLock(0, "}\n");
+}
+
 
 bool SuperNode::instsEmpty() {
   return insts.size() == 0;
@@ -719,6 +900,7 @@ bool graph::__emitSrc(int indent, bool canNewFile, bool alreadyEndFunc, const ch
       if (!alreadyEndFunc) fprintf(srcFp, "}"); // the end of the current function
       fclose(srcFp);
     }
+    std::filesystem::create_directories(globalConfig.OutputDir);
     srcFp = std::fopen(format("%s%d.cpp", (globalConfig.OutputDir + "/" + name).c_str(), srcFileIdx).c_str(), "w");
     srcFileIdx ++;
     assert(srcFp != NULL);
@@ -927,4 +1109,173 @@ void graph::cppEmitter() {
 
   printf("[cppEmitter] define %ld nodes %d superNodes\n", definedNode.size(), superId);
   std::cout << "[cppEmitter] finish writing " << srcFileIdx << " cpp files to " + globalConfig.OutputDir + "/" << std::endl;
+}
+
+void graph::cppEmitterMultithread() {
+    assert(subGraphs.size() != 0);
+    FILE *header = this->genHeaderStart();
+    // srcFp = stdout;
+    /* class start*/
+    fprintf(header, "class S%s {\npublic:\n", name.c_str());
+    fprintf(header, "uint64_t cycles;\n");
+    fprintf(header, "uint64_t LOG_START, LOG_END;\n");
+    for(int i = 0; i < subGraphs.size(); i++) {
+      auto g = subGraphs[i];
+      int superIdBeg = superId;
+      for (SuperNode* super : g->sortedSuper) {
+        if (!super->instsEmpty() || super->superType == SUPER_EXTMOD || super->superType == SUPER_ASYNC_RESET) {
+          super->cppId = superId ++;
+          cppId2Super[super->cppId] = super;
+          if (super->superType == SUPER_EXTMOD) {
+            alwaysActive.insert(super->cppId);
+          }
+        }
+      }
+      int superIdEnd = superId;
+      assert(threadSuperIdBound.size() == i);
+      threadSuperIdBound.push_back(std::pair(superIdBeg, superIdEnd));
+
+      for (SuperNode* super : g->sortedSuper) {
+        for (Node* member : super->member) {
+          if (member->status == VALID_NODE) {
+            member->updateActivate();
+            member->updateNeedActivate(alwaysActive);
+          }
+        }
+      }
+
+      fprintf(header, "uint%d_t activeFlags$t%d[%d];\n", ACTIVE_WIDTH, i, (int)ROUNDUP(g->sortedSuper.size(), 8)); // or super.size() if id == idx
+
+    }
+
+  #ifdef PERF
+    fprintf(header, "size_t activeTimes[%d];\n", superId);
+  #if ENABLE_ACTIVATOR
+    fprintf(header, "std::map<int, int>activator[%d];\n", superId);
+  #endif
+    fprintf(header, "size_t validActive[%d];\n", superId);
+    fprintf(header, "size_t nodeNum[%d];\n", superId);
+  #endif
+    emitPrintf();
+    emitFuncDecl(0, "S%s::S%s() {\n"
+               "  cycles = 0;\n"
+               "  LOG_START = 1;\n"
+               "  LOG_END = 0;\n"
+               "  init();\n"
+               "}\n", name.c_str(), name.c_str());
+  /* initialization */
+    emitFuncDecl(0, "void S%s::init() {\n", name.c_str());
+    emitBodyLock(1, "activateAll();\n");
+  #ifdef PERF
+    emitBodyLock(1, "for (int i = 0; i < %d; i ++) activeTimes[i] = 0;\n", superId);
+    #if ENABLE_ACTIVATOR
+    emitBodyLock(1, "for (int i = 0; i < %d; i ++) activator[i] = std::map<int, int>();\n", superId);
+    #endif
+    for (SuperNode* super : sortedSuper) {
+      if (super->cppId >= 0) {
+        size_t num = 0;
+        for (Node* member : super->member) {
+          if (member->anyNextActive()) num ++;
+        }
+        emitBodyLock(1, "nodeNum[%d] = %ld; // memberNum=%ld\n", super->cppId, num, super->member.size());
+      }
+    }
+    emitBodyLock(1, "for (int i = 0; i < %d; i ++) validActive[i] = 0;\n", superId);
+  #endif
+    emitBodyLock(0, "#ifdef RANDOMIZE_INIT\n"
+                 "  srand((unsigned int)time(NULL));\n"
+                 "  for (uint32_t *p = &_var_start; p != &_var_end; p ++) {\n"
+                 "    *p = rand();\n"
+                 "  }\n"
+                 "// mask out the bits out of the width range\n");
+    // header: node definition; src: node evaluation
+    fprintf(header, "uint32_t _var_start;\n");
+    for (SuperNode* super : sortedSuper) {
+      // std::string insts;
+      if (super->superType == SUPER_VALID || super->superType == SUPER_ASYNC_RESET) {
+        for (Node* n : super->member) genNodeDef(header, n);
+      }
+      if (super->superType == SUPER_EXTMOD) {
+        for (size_t i = 1; i < super->member.size(); i ++) genNodeDef(header, super->member[i]);
+      }
+    }
+
+    /* memory definition */
+    for (Node* mem : memory) genNodeDef(header, mem);
+    fprintf(header, "uint32_t _var_end;\n");
+
+    emitBodyLock(0, "// initialize registers with reset value 0 to overwrite the rand() results\n" );
+    emitBodyLock(1, "memset(&_var_start, 0, &_var_end - &_var_start);\n");
+
+    emitBodyLock(0, "#else\n" // RANDOMIZE_INIT
+                "  memset(&_var_start, 0, &_var_end - &_var_start);\n"
+                "#endif\n");
+
+    fprintf(header, "S%s();\n", name.c_str());
+    fprintf(header, "void init();\n");
+
+    emitBodyLock(0, "}\n");
+
+    /* activation all nodes for reset */
+    fprintf(header, "void activateAll();\n");
+    emitFuncDecl(0, "void S%s::activateAll() {\n", name.c_str());
+    for(int i=0;i<subGraphs.size();i++) {
+      emitBodyLock(1, "memset(activeFlags$t%d, 0xff, sizeof(activeFlags$t%d));\n", i, i);
+    }
+    emitBodyLock(0, "}\n");
+
+    /* input/output interface */
+    for (Node* node : input) {
+      fprintf(header, "void set_%s(%s val);\n", node->name.c_str(), widthUType(node->width).c_str());
+      genInterfaceInput(node);
+    }
+    for (Node* node : output) {
+      fprintf(header, "%s get_%s();\n", widthUType(node->width).c_str(), node->name.c_str());
+      genInterfaceOutput(node);
+    }
+
+    /* reset functions */
+    fprintf(header, "void resetAll();\n");
+    genResetAll();
+    for (int i = 0; i < resetFuncNum; i ++) {
+      fprintf(header, "void subReset%d();\n", i);
+    }
+
+    /* main evaluation loop (step) */
+    for(auto g : subGraphs) {
+      g->srcFp = srcFp;
+      g->srcFileIdx = srcFileIdx;
+      g->name = this->name;
+      int subStepIdxMax = g->genActivateForThread();
+      for (int i = 0; i <= subStepIdxMax; i ++) {
+        fprintf(header, "void subStep%d$t%d();\n", i, g->threadId);
+      }
+      /* step wrapper for multithreading */
+      fprintf(header, "void step$t%d();\n", g->threadId);
+      g->genStepForThread(subStepIdxMax);
+    }
+
+    fprintf(header, "void global_update();\n");
+    emitFuncDecl(0, "void S%s::global_update() {\n", name.c_str());
+    for(auto src : this->regsrc) {
+      emitBodyLock(1, "%s = %s;\n", src->name.c_str(), src->getDst()->name.c_str());
+    }
+    emitBodyLock(0, "}\n");
+
+    /* step wrapper for simulation */  
+    fprintf(header, "void step();\n");
+    genStep(subGraphs.size());    
+
+    /* end of header file */
+    fprintf(header, "};\n"
+                     "#endif\n");
+    fclose(header);
+    fclose(srcFp);
+
+    printf("[cppEmitter] define %ld nodes %d superNodes\n", definedNode.size(), superId);
+    for(auto g : subGraphs) {
+        int superNum = threadSuperIdBound[g->threadId].second - threadSuperIdBound[g->threadId].first;
+        printf("[cppEmitter] thread %d define %d superNodes\n", g->threadId, superNum);
+    }
+    std::cout << "[cppEmitter] finish writing " << srcFileIdx << " cpp files to " + globalConfig.OutputDir + "/" << std::endl;
 }

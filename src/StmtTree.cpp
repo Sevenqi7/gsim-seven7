@@ -360,6 +360,12 @@ void SuperNode::reorderMember() {
 }
 
 void graph::generateStmtTree() {
+
+  // if(subGraphs.size() != 0) {
+  //     for(auto g : subGraphs)  g->generateStmtTree();
+  //     return;
+  // }
+
   orderAllNodes();
   std::map<Node*, std::vector<int>> allPath; // order in seq
   /* add when path for nodes with len(next in same SN) == 1 */

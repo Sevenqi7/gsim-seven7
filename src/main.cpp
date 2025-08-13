@@ -20,7 +20,7 @@ graph* AST2Graph(PNode* root);
 void inferAllWidth();
 
 Config::Config() {
-  EnableDumpGraph = false;
+  EnableDumpGraph = true;
   OutputDir = ".";
   SuperNodeMaxSize = 35;
   cppMaxSizeKB = -1;
@@ -134,7 +134,6 @@ int main(int argc, char** argv) {
   graph* g = NULL;
   static int dumpIdx = 0;
   const char *InputFileName = parseCommandLine(argc, argv);
-  printf("threadnum: %d\n", globalConfig.ThreadNum);
   size_t size = 0, mapSize = 0;
   char *strbuf;
   FUNC_TIMER(strbuf = readFile(InputFileName, size, mapSize));
@@ -172,21 +171,27 @@ int main(int argc, char** argv) {
   FUNC_WRAPPER(g->patternDetect(), "PatternDetect");
 
   FUNC_WRAPPER(g->commonExpr(), "CommonExpr");
-
+  
   FUNC_WRAPPER(g->removeDeadNodes(), "RemoveDeadNodes");
+
+  g->naiveRepcutForThreads(globalConfig.ThreadNum);
 
   FUNC_WRAPPER(g->graphPartition(), "graphPartition");
 
-  FUNC_WRAPPER(g->replicationOpt(), "Replication");
+  // FUNC_WRAPPER(g->replicationOpt(), "Replication");
 
   // FUNC_WRAPPER(g->mergeRegister(), "MergeRegister");
 
   // FUNC_WRAPPER(g->constructRegs(), "ConstructRegs");
+  
   FUNC_TIMER(g->generateStmtTree());
 
   FUNC_TIMER(g->instsGenerator());
 
-  FUNC_WRAPPER(g->cppEmitter(), "Final");
+  if(globalConfig.ThreadNum == 1)
+      FUNC_WRAPPER(g->cppEmitter(), "Final");
+  else 
+      FUNC_WRAPPER(g->cppEmitterMultithread(), "Final");
 
   TIMER_END(total);
 

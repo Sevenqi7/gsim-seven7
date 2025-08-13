@@ -1,11 +1,11 @@
 #include "common.h"
+#include "config.h"
 #include <queue>
-#include <map>
 
 int Node::counter = 1;
 
 void Node::updateConnect() {
-  if (type == NODE_REG_SRC) return;
+  if (type == NODE_REG_SRC || type == NODE_REG_SNAP) return;
   std::queue<ENode*> q;
   for (ExpTree* tree : assignTree) {
     q.push(tree->getRoot());
@@ -220,7 +220,10 @@ void Node::updateActivate() {
     }
   }
   if (type == NODE_REG_DST) {
-    nextActiveId.insert(getSrc()->super->cppId);
+    if(globalConfig.ThreadNum == 1)
+      nextActiveId.insert(getSrc()->super->cppId);
+    else 
+      nextActiveId.insert(super->cppId);
   }
   if (type == NODE_WRITER) {
     for (Node* port : parent->member) {

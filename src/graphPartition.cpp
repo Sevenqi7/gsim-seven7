@@ -1,4 +1,5 @@
 #include "common.h"
+#include "config.h"
 #include <climits>
 #include <cstddef>
 #include <map>
@@ -42,6 +43,17 @@ void graph::resort() {
     }
   }
 
+  if(sortedSuper.size() != prevSize) {
+      printf("ThreadID:%d\n", threadId);
+      printf("Sortedsuper:\n");
+      for(auto super : sortedSuper) {
+          printf("\t%s\n", super->member[0]->name.c_str());
+      }
+      printf("prevsuper:\n");
+      for(auto super : prevSuper) {
+          printf("\t%s\n", super->member[0]->name.c_str());
+      }
+  }
   Assert(sortedSuper.size() == prevSize, "invalid size %ld %ld\n", sortedSuper.size(), prevSize);
   orderAllNodes();
 }
@@ -365,6 +377,11 @@ void graph::graphRefine() {
 }
 
 void graph::graphPartition() {
+  if(subGraphs.size() != 0) {
+      mergeResetAll();
+      for(auto g : subGraphs) g->graphPartition();
+      return;
+  }
   size_t totalSuper = sortedSuper.size();
   size_t phaseSuper = sortedSuper.size();
   orderAllNodes();
@@ -383,4 +400,125 @@ void graph::graphPartition() {
   // graphRefine();
   phaseSuper = sortedSuper.size();
   printf("[graphPartition] remove %ld superNodes (%ld -> %ld)\n", totalSuper - phaseSuper, totalSuper, phaseSuper);
+}
+
+void graph::naiveRepcutForThreads(int numThreads) {
+    if (numThreads == 1) return ;
+    orderAllNodes();
+
+    std::set<Node *> global_visited;
+    std::vector<std::map<Node *, Node *> *> repNodeTableList;
+
+    int numRegs = regsrc.size();
+    if(numThreads > numRegs) {
+        printf("\nWarning: The requested number of threads (%d) exceeds the number of registers (%d). " \
+                "The simulation will proceed with %d threads (equal to the register count) instead. \n\n" , numThreads, numRegs, numRegs);
+        numThreads = numRegs;
+        globalConfig.ThreadNum = numThreads;
+        if(numThreads == 1) return;
+    }
+    
+    for(int i=0;i<numThreads;i++) {
+      graph *new_graph = new graph;
+      new_graph->name = name;
+      new_graph->threadId = i;
+      subGraphs.push_back(new_graph);
+      repNodeTableList.push_back(new std::map<Node *, Node*>);
+    }
+
+    for(int i = 0; i < (numRegs + output.size()); i++) {
+        int threadId = i % numThreads;
+        auto g = subGraphs[threadId];
+        std::stack<Node *> s;
+        std::set<Node *> visited;
+        std::set<Node *> rely;
+        Node *sinkNode;
+        if(i < numRegs) {
+            auto src = regsrc[i];
+            sinkNode = src->getDst();
+            g->regsrc.push_back(src);
+            global_visited.insert(src);
+            snapTable.insert(std::pair(src, new std::set<Node *>));
+            s.push(sinkNode);
+        } else if(output[i - numRegs]->next.empty()){
+            sinkNode = output[i - numRegs];
+        } else {
+            continue;
+        }
+        g->sortedSuper.push_back(sinkNode->super);
+        s.push(sinkNode);
+        assert(sinkNode->next.empty());
+
+        while(!s.empty()) {
+            auto node = s.top();
+            s.pop();
+            if(visited.find(node) == visited.end()) {
+                visited.insert(visited.end(), node);
+                rely.insert(node);
+                for(auto prev : node->prev) {
+                    if(visited.find(prev) == visited.end()) {
+                        s.push(prev);
+                    }
+                }
+            }
+        }
+        
+        rely.erase(sinkNode);
+        auto repNodeTable = repNodeTableList[threadId];
+        for(auto node : rely){
+          if(global_visited.find(node) != global_visited.end()) {
+            if(repNodeTable->find(node) == repNodeTable->end()) {
+              NodeType node_type;
+              switch(node->type) {
+                  case NODE_REG_SRC: node_type = NODE_REG_SNAP; break;
+                  case NODE_OUT:
+                  case NODE_INP: node_type = NODE_OTHERS; break;
+                  default: node_type = node->type;
+              }
+              std::string dupName = node_type == NODE_REG_SNAP ? format("%s$snap_t%d", node->name.c_str(), threadId) :
+                                    node->type == NODE_INP     ? node->name.c_str() : // trick: keep the name snapshots the same as input ports
+                                                                 format("%s$DUP_t%d", node->name.c_str(), threadId);
+              Node *repNode = node->dup(node_type, dupName);
+
+              if(node->type == NODE_INP) {
+                if(snapTable.find(node) == snapTable.end())
+                  snapTable.insert(std::pair(node, new std::set<Node*>));
+                snapTable.find(node)->second->insert(repNode);
+                // auto cp = new ExpTree(new ENode(node), new ENode(repNode));
+                // repNode->assignTree.push_back(cp);
+              } else 
+                repNode->assignTree.push_back(new ExpTree(node->assignTree[0]->getRoot()->dup(), new ENode(repNode)));
+              repNode->super = new SuperNode(repNode);
+              repNodeTable->insert(std::pair(node, repNode));
+              sortedSuper.push_back(repNode->super);
+              g->sortedSuper.push_back(repNode->super);
+            }
+          } else {
+              global_visited.insert(node);
+              g->sortedSuper.push_back(node->super);
+          }
+        }
+
+    }
+
+    for(auto g : subGraphs) {
+        for(auto super : g->sortedSuper) {
+            auto repNodeTable = repNodeTableList[g->threadId];
+            for(auto node : super->member) {
+                if(node->type == NODE_REG_SNAP) {
+                    auto regsrc = node->assignTree[0]->getRoot()->nodePtr->getSrc();
+                    snapTable[regsrc]->insert(node);
+                    node->assignTree[0]->getRoot()->setNode(regsrc);
+                }else{
+                  for (auto tree : node->assignTree)
+                      tree->replace(*repNodeTable);
+                }
+            }
+        }
+        g->reconnectAll();
+        printf("thread %d:\n", g->threadId);
+        g->traversal();
+        g->dump("Thread" + std::to_string(g->threadId));
+        printf("thread %d done.\n", g->threadId);
+    }
 }

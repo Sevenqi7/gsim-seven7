@@ -15,6 +15,7 @@ enum NodeType{
   NODE_INVALID,
   NODE_REG_SRC,
   NODE_REG_DST,
+  NODE_REG_SNAP,
   NODE_SPECIAL, // printf & assert
   NODE_INP,
   NODE_OUT,
