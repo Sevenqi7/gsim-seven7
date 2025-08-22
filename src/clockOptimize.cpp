@@ -244,7 +244,7 @@ void graph::clockOptimize(std::map<std::string, Node*>& allSignals) {
               tree->setRoot(gateDup);
             }
           }
-        } else if (val->node) {
+        } else if (val->node && clockMember->type != NODE_INP) {
           ENode* clockENode = new ENode(val->node);
           clockENode->width = val->node->width;
           clockMember->assignTree[0]->setRoot(clockENode);
