@@ -2,6 +2,7 @@
 #include "config.h"
 #include <climits>
 #include <cstddef>
+#include <iterator>
 #include <map>
 #include <cstdio>
 #include <queue>
@@ -406,18 +407,30 @@ void graph::naiveRepcutForThreads(int numThreads) {
     if (numThreads == 1) return ;
     orderAllNodes();
 
+    std::vector<Node *> sinkNode;
+    std::vector<Node *> writer;
     std::set<Node *> global_visited;
     std::vector<std::map<Node *, Node *> *> repNodeTableList;
 
-    int numRegs = regsrc.size();
-    if(numThreads > numRegs) {
-        printf("\nWarning: The requested number of threads (%d) exceeds the number of registers (%d). " \
-                "The simulation will proceed with %d threads (equal to the register count) instead. \n\n" , numThreads, numRegs, numRegs);
-        numThreads = numRegs;
+    for(auto mem : memory) {
+        for (auto n : mem->member)
+          if(n->type == NODE_WRITER)
+            writer.push_back(n);
+    }
+    sinkNode.insert(sinkNode.end(), regsrc.begin(), regsrc.end());
+    sinkNode.insert(sinkNode.end(), writer.begin(), writer.end());
+    std::copy_if(output.begin(), output.end(), std::back_inserter(sinkNode), [](Node *out){return out->next.empty();});
+
+    int numSinks = sinkNode.size();
+    if(numThreads > numSinks) {
+        printf("\nWarning: The requested number of threads (%d) exceeds the number of parallelizable node (%d). " \
+                "The simulation will proceed with %d threads instead. \n\n" , numThreads, numSinks, numSinks);
+        numThreads = numSinks;
         globalConfig.ThreadNum = numThreads;
         if(numThreads == 1) return;
     }
-    
+
+
     for(int i=0;i<numThreads;i++) {
       graph *new_graph = new graph;
       new_graph->name = name;
@@ -426,28 +439,24 @@ void graph::naiveRepcutForThreads(int numThreads) {
       repNodeTableList.push_back(new std::map<Node *, Node*>);
     }
 
-    for(int i = 0; i < (numRegs + output.size()); i++) {
+    for(int i = 0; i < sinkNode.size(); i++) {
         int threadId = i % numThreads;
         auto g = subGraphs[threadId];
         std::stack<Node *> s;
         std::set<Node *> visited;
         std::set<Node *> rely;
-        Node *sinkNode;
-        if(i < numRegs) {
-            auto src = regsrc[i];
-            sinkNode = src->getDst();
+        Node *sink = sinkNode[i];
+        if(sink->type == NODE_REG_SRC) {
+            auto src = sink;
+            sink = src->getDst();
             g->regsrc.push_back(src);
             global_visited.insert(src);
             snapTable.insert(std::pair(src, new std::set<Node *>));
-            s.push(sinkNode);
-        } else if(output[i - numRegs]->next.empty()){
-            sinkNode = output[i - numRegs];
-        } else {
-            continue;
-        }
-        g->sortedSuper.push_back(sinkNode->super);
-        s.push(sinkNode);
-        assert(sinkNode->next.empty());
+            s.push(sink);
+          } 
+        g->sortedSuper.push_back(sink->super);
+        s.push(sink);
+        assert(sink->next.empty());
 
         while(!s.empty()) {
             auto node = s.top();
@@ -463,31 +472,39 @@ void graph::naiveRepcutForThreads(int numThreads) {
             }
         }
         
-        rely.erase(sinkNode);
+        rely.erase(sink);
         auto repNodeTable = repNodeTableList[threadId];
         for(auto node : rely){
-          if(global_visited.find(node) != global_visited.end()) {
-            if(repNodeTable->find(node) == repNodeTable->end()) {
+          if(node->name == "commit_ptr")
+              printf("\n");
+          if(global_visited.find(node) != global_visited.end() || node->type == NODE_REG_SRC) {
+            if(repNodeTable->find(node) == repNodeTable->end() &&
+              std::find(g->sortedSuper.begin(), g->sortedSuper.end(), node->super) ==  g->sortedSuper.end()
+            ) {
               NodeType node_type;
               switch(node->type) {
                   case NODE_REG_SRC: node_type = NODE_REG_SNAP; break;
                   case NODE_OUT:
-                  case NODE_INP: node_type = NODE_OTHERS; break;
-                  default: node_type = node->type;
+                  case NODE_INP: node_type = NODE_DUP; break;
+                  default: node_type = NODE_DUP;
               }
-              std::string dupName = node_type == NODE_REG_SNAP ? format("%s$snap_t%d", node->name.c_str(), threadId) :
-                                    node->type == NODE_INP     ? node->name.c_str() : // trick: keep the name snapshots the same as input ports
+              std::string dupName =  node->type == NODE_INP     ? node->name.c_str() :
+                                     node_type == NODE_REG_SNAP ? format("%s$snap_t%d", node->name.c_str(), threadId) :
+                                     // trick: keep the name snapshots the same as input ports
                                                                  format("%s$DUP_t%d", node->name.c_str(), threadId);
               Node *repNode = node->dup(node_type, dupName);
-
               if(node->type == NODE_INP) {
                 if(snapTable.find(node) == snapTable.end())
                   snapTable.insert(std::pair(node, new std::set<Node*>));
                 snapTable.find(node)->second->insert(repNode);
-                // auto cp = new ExpTree(new ENode(node), new ENode(repNode));
-                // repNode->assignTree.push_back(cp);
               } else 
                 repNode->assignTree.push_back(new ExpTree(node->assignTree[0]->getRoot()->dup(), new ENode(repNode)));
+
+              if(node->type == NODE_READER)
+                repNode->parent = node->parent;
+              else
+                repNode->parent = node;
+
               repNode->super = new SuperNode(repNode);
               repNodeTable->insert(std::pair(node, repNode));
               sortedSuper.push_back(repNode->super);
@@ -507,7 +524,12 @@ void graph::naiveRepcutForThreads(int numThreads) {
             for(auto node : super->member) {
                 if(node->type == NODE_REG_SNAP) {
                     auto regsrc = node->assignTree[0]->getRoot()->nodePtr->getSrc();
+                    // auto regdst = regsrc->getDst();
                     snapTable[regsrc]->insert(node);
+                    node->parent = regsrc;
+                    g->regsnap.push_back(node);
+                    // if(std::find(g->sortedSuper.begin(), g->sortedSuper.end(), regdst->super) == g->sortedSuper.end())
+                    //   node->assignTree.pop_back();
                     node->assignTree[0]->getRoot()->setNode(regsrc);
                 }else{
                   for (auto tree : node->assignTree)
@@ -516,9 +538,23 @@ void graph::naiveRepcutForThreads(int numThreads) {
             }
         }
         g->reconnectAll();
+
+
         printf("thread %d:\n", g->threadId);
         g->traversal();
         g->dump("Thread" + std::to_string(g->threadId));
         printf("thread %d done.\n", g->threadId);
     }
+
+    // for(auto g : subGraphs) {
+    //           for(auto snap : g->regsnap) {
+    //        for(auto next: snap->depNext) {
+    //           bool isSink = next->next.empty();
+    //           if(isSink) {
+    //             next->assignTree.pop_back();
+    //             break;
+    //           }
+    //        }
+    //     }
+    // }
 }

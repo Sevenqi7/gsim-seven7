@@ -28,6 +28,7 @@ class graph {
   void genMemInit(Node* node);
   void nodeDisplay(Node* member, int indent);
   void genMemRead(FILE* fp);
+  void genSnapDef();
   int genActivate();
   int genActivateForThread();
   void genUpdateRegister(FILE* fp);
@@ -66,6 +67,7 @@ class graph {
   std::vector<Node*> input;
   std::vector<Node*> output;
   std::vector<Node*> regsrc;
+  std::vector<Node*> regsnap;
   std::vector<Node*> sorted;
   std::vector<Node*> memory;
   std::vector<Node*> external;

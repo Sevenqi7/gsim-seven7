@@ -382,10 +382,12 @@ void graph::genDiffSig(FILE* fp, Node* node) {
 #endif
 
 void graph::genNodeDef(FILE* fp, Node* node) {
+  if(node->name == "_T_7")
+      printf("\n");
   if (node->type == NODE_SPECIAL || node->type == NODE_REG_RESET || (node->status != VALID_NODE)) return;
   if (node->type == NODE_REG_DST && !node->regSplit) return;
   if (node->type == NODE_WRITER) return;
-  if (node->type == NODE_REG_SNAP) return;
+  if (node->type == NODE_REG_SNAP || node->type == NODE_DUP) return;
   if (node->isLocal()) return;
 #if defined(GSIM_DIFF) || defined(VERILATOR_DIFF)
   genDiffSig(fp, node);
@@ -530,6 +532,7 @@ void graph::nodeDisplay(Node* member, int indent) {
 
   if (member->status != VALID_NODE) return;
   if (member->type == NODE_WRITER) return;
+  if (member->type == NODE_MEMORY) return;
   emitBodyLock(indent, "printf(\"%%ld %d %s: \", cycles);\n", member->super->cppId, member->name.c_str());
   if (member->dimension.size() != 0) {
     std::string idxStr;
@@ -565,7 +568,7 @@ int graph::genNodeStepEnd(SuperNode* node, int indent) {
 }
 
 bool Node::isLocal() { // TODO: isArray is OK
-  return status == VALID_NODE && (type == NODE_OTHERS || type == NODE_REG_SNAP) && !anyNextActive() && (!isArray()) && !isReset();
+  return status == VALID_NODE && (type == NODE_OTHERS || type == NODE_DUP || type == NODE_REG_SNAP) && (!anyNextActive()) && (!isArray()) && !isReset();
 }
 
 int graph::translateInst(InstInfo inst, int indent, std::string flagName) {
@@ -619,8 +622,14 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, int indent) { /
     }
     /* local nodes definition */
     for (Node* n : super->member) {
+      if(n->name == "sb_mem$$valid$snap_t0") 
+        printf("\n");
       if (n->isLocal()) {
-        emitBodyLock(indent, "%s %s;\n", widthUType(n->width).c_str(), n->name.c_str());
+        emitBodyLock(indent, "%s %s", widthUType(n->width).c_str(), n->name.c_str());
+        if(n->isArray()) {
+          for (int dim : n->dimension) emitBodyLock(0, "[%d]", upperPower2(dim));
+        }
+        emitBodyLock(0,";\n");
       }
     }
     for (InstInfo inst : super->insts) {
@@ -638,6 +647,44 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, int indent) { /
   }
 }
 
+void graph::genSnapDef() {
+    int indent = 1;
+    // for (auto snap : regsnap) {
+    //     auto src = snap->parent;
+    //     if(snap->assignTree.empty()) {
+    //       emitBodyLock(indent, "const auto& %s = %s;\n", snap->name.c_str(), snapName.c_str());
+    //       continue;
+    //     }
+    //     if(snap->isArray()) {
+    //         emitBodyLock(indent, "%s %s",widthUType(snap->width).c_str(), snap->name.c_str());
+    //         for (int dim : snap->dimension) emitBodyLock(0, "[%d]", upperPower2(dim));
+    //         emitBodyLock(0, ";\n");
+    //         emitBodyLock(indent, "memcpy(%s, %s, sizeof(%s));\n", snap->name.c_str(), snapName.c_str(), snapName.c_str());
+    //     }
+    //     else
+    //       emitBodyLock(indent, "%s %s = %s;\n",widthUType(snap->width).c_str(), snap->name.c_str(), snapName.c_str());
+    // }
+    
+    for (auto super : sortedSuper) {
+      for (auto member : super->member) {
+        auto src = member->parent;
+        if (!member->isLocal() && (member->type == NODE_REG_SNAP || member->type == NODE_DUP) && member->parent->type != NODE_INP) {
+          std::string oldName = format("%s_old", src->name.c_str());
+          if(member->type == NODE_DUP) {
+            emitBodyLock(indent, "static %s %s;\n",widthUType(member->width).c_str(), member->name.c_str());
+          }
+          else if(member->isArray()) {
+              emitBodyLock(indent, "%s %s",widthUType(member->width).c_str(), member->name.c_str());
+              for (int dim : member->dimension) emitBodyLock(0, "[%d]", upperPower2(dim));
+              emitBodyLock(0, ";\n");
+              emitBodyLock(indent, "memcpy(%s, %s, sizeof(%s));\n", member->name.c_str(), oldName.c_str(), oldName.c_str());
+          }
+          else
+            emitBodyLock(indent, "%s %s = %s;\n",widthUType(member->width).c_str(), member->name.c_str(), oldName.c_str());
+        }
+      }
+    }
+}
 
 int graph::genActivate() {
     emitFuncDecl(0, "void S%s::subStep0() {\n", name.c_str());
@@ -682,6 +729,7 @@ int graph::genActivate() {
 int graph::genActivateForThread() {
     assert(threadId != -1);
     emitFuncDecl(0, "void S%s::subStep0$t%d() {\n", name.c_str(), threadId);
+    genSnapDef();
     int indent = 1;
     int nextSubStepIdx = 1;
     std::string nextFuncDef = format("void S%s::subStep%d$t%d()", name.c_str(), threadId, nextSubStepIdx);
@@ -1114,6 +1162,7 @@ void graph::cppEmitter() {
 void graph::cppEmitterMultithread() {
     assert(subGraphs.size() != 0);
     FILE *header = this->genHeaderStart();
+    // FILE *header = stdout;
     // srcFp = stdout;
     /* class start*/
     fprintf(header, "class S%s {\npublic:\n", name.c_str());
@@ -1256,15 +1305,43 @@ void graph::cppEmitterMultithread() {
     }
 
     fprintf(header, "void global_update();\n");
+    // emitFuncDecl(0, "void S%s::snapshot() {\n", name.c_str());
+    // for(auto it : snapTable) {
+    //     if(it.first->type == NODE_REG_SRC) {
+    //         auto src = it.first;
+    //         std::string snapName = format("%s_snap", src->name.c_str());
+    //         emitBodyLock(1, "%s = %s;\n", snapName.c_str(), src->name.c_str());
+    //     }
+    // }
+    // emitBodyLock(0, "}\n");
+
     emitFuncDecl(0, "void S%s::global_update() {\n", name.c_str());
+    // emitBodyLock(1, "snapshot();\n");
     for(auto src : this->regsrc) {
-      emitBodyLock(1, "%s = %s;\n", src->name.c_str(), src->getDst()->name.c_str());
+      if(src->isArray()) 
+        emitBodyLock(1, "memcpy(%s, %s, sizeof(%s));\n", src->name.c_str(), src->getDst()->name.c_str(), src->name.c_str());
+      else 
+        emitBodyLock(1, "%s = %s;\n", src->name.c_str(), src->getDst()->name.c_str());
     }
     emitBodyLock(0, "}\n");
-
+    
     /* step wrapper for simulation */  
     fprintf(header, "void step();\n");
     genStep(subGraphs.size());    
+    
+    /* register old value */
+    fprintf(header, "private:\n");
+    fprintf(header, "void snapshot();\n");
+    for(auto it : snapTable) {
+        if(it.first->type == NODE_REG_SRC) {
+            auto src = it.first;
+            std::string snapName = format("%s_old", src->name.c_str());
+            if(src->isArray()){
+              for (int dim : src->dimension) snapName += format("[%d]", upperPower2(dim));
+            }                
+            fprintf(header, "%s %s;\n", widthUType(src->width).c_str(), snapName.c_str());
+        }
+    }
 
     /* end of header file */
     fprintf(header, "};\n"
